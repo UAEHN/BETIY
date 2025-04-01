@@ -1,0 +1,969 @@
+'use client';
+
+import { useState, useEffect, useRef } from 'react';
+import { supabase } from '@/lib/supabase';
+import { formatDate } from '@/lib/utils';
+import { Message, User, Group, GroupMember, ProductListMessage } from '@/types';
+import { getUserGroups } from '@/lib/api/groups';
+
+// مكونات Shadcn UI
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription, CardFooter } from '@/components/ui/card';
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from '@/components/ui/sheet';
+import { Button } from '@/components/ui/button';
+import { Users, PenLine } from 'lucide-react';
+
+import ProductMessage from './product-message';
+import ProductListView from './product-list-view';
+
+// تعريف نوع Payload للتغييرات في الوقت الفعلي
+type PostgresChangesPayload = {
+  commit_timestamp: string;
+  eventType: 'INSERT' | 'UPDATE' | 'DELETE';
+  schema: string;
+  table: string;
+  new: any;
+  old: any;
+};
+
+// تعريف نوع للرسائل من قاعدة البيانات
+type DbMessage = {
+  id: string;
+  user_id: string;
+  message: string;
+  group_id?: string;
+  timestamp: string;
+  message_type: string;
+  product_list?: ProductListMessage;
+  read_by?: string[];
+  is_read?: boolean;
+  user?: User;
+};
+
+interface ChatProps {
+  groupId?: string;
+}
+
+export default function Chat({ groupId }: ChatProps) {
+  const [messages, setMessages] = useState<DbMessage[]>([]);
+  const [newMessage, setNewMessage] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [groupDetails, setGroupDetails] = useState<Group | null>(null);
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Scroll to bottom of messages
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  // تنفيذ التمرير لأسفل عند تغيير الرسائل
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  // Fetch current user
+  useEffect(() => {
+    const getCurrentUser = async () => {
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (sessionData?.session?.user) {
+          const { data: userData, error: userError } = await supabase
+            .from('users')
+            .select('*')
+            .eq('id', sessionData.session.user.id)
+            .single();
+
+          if (userError) {
+            console.error('Error fetching user data:', userError);
+            setCurrentUser({
+              id: sessionData.session.user.id,
+              name: 'أنت',
+              avatar_url: '',
+              email: null
+            });
+            return;
+          }
+
+          if (userData) {
+            setCurrentUser(userData as User);
+          } else {
+            setCurrentUser({
+              id: sessionData.session.user.id,
+              name: 'أنت',
+              avatar_url: '',
+              email: null
+            });
+          }
+        } else {
+          // إعداد مستخدم وهمي للعرض
+          setCurrentUser({
+            id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+            name: 'أنت',
+            avatar_url: '',
+            email: null
+          });
+        }
+      } catch (err) {
+        console.error('Error getting current user:', err);
+        setCurrentUser({
+          id: 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+          name: 'أنت',
+          avatar_url: '',
+          email: null
+        });
+      }
+    };
+
+    getCurrentUser();
+  }, []);
+
+  // جلب بيانات المجموعة عند تغيير الـ groupId
+  useEffect(() => {
+    const fetchGroupDetails = async () => {
+      if (!groupId) return;
+      
+      try {
+        console.log('جاري جلب بيانات المجموعة:', groupId);
+        
+        // جلب تفاصيل المجموعة
+        const { data: groupData, error: groupError } = await supabase
+          .from('groups')
+          .select('*')
+          .eq('id', groupId)
+          .single();
+          
+        if (groupError) {
+          console.error('خطأ في جلب بيانات المجموعة:', groupError);
+          return;
+        }
+        
+        // جلب معرفات المستخدمين في المجموعة
+        const { data: memberData, error: memberError } = await supabase
+          .from('group_members')
+          .select('user_id, role')
+          .eq('group_id', groupId);
+        
+        if (memberError) {
+          console.error('خطأ في جلب بيانات الأعضاء:', memberError);
+          // إنشاء كائن المجموعة بدون أعضاء
+          const group: Group = {
+            id: groupData.id as string,
+            name: groupData.name as string,
+            created_by: groupData.created_by as string,
+            created_at: groupData.created_at as string,
+            updated_at: groupData.updated_at as string,
+            members: []
+          };
+          setGroupDetails(group);
+          return;
+        }
+        
+        if (!memberData || memberData.length === 0) {
+          console.log('لا يوجد أعضاء في المجموعة');
+          const group: Group = {
+            id: groupData.id as string,
+            name: groupData.name as string,
+            created_by: groupData.created_by as string,
+            created_at: groupData.created_at as string,
+            updated_at: groupData.updated_at as string,
+            members: []
+          };
+          setGroupDetails(group);
+          return;
+        }
+        
+        // جلب بيانات المستخدمين
+        const { data: userData, error: userError } = await supabase
+          .from('users')
+          .select('*')
+          .in('id', memberData.map(member => member.user_id));
+        
+        if (userError || !userData) {
+          console.error('خطأ في جلب بيانات المستخدمين:', userError);
+          const group: Group = {
+            id: groupData.id as string,
+            name: groupData.name as string,
+            created_by: groupData.created_by as string,
+            created_at: groupData.created_at as string,
+            updated_at: groupData.updated_at as string,
+            members: []
+          };
+          setGroupDetails(group);
+          return;
+        }
+        
+        // ربط بيانات المستخدمين بأدوارهم في المجموعة
+        const membersWithRoles: GroupMember[] = userData.map(user => {
+          const memberInfo = memberData.find(member => member.user_id === user.id);
+          // إنشاء كائن عضو المجموعة
+          return {
+            id: user.id as string, // نستخدم معرف المستخدم كمعرف للعضو للتبسيط
+            group_id: groupId,
+            user_id: user.id as string,
+            role: (memberInfo?.role as 'admin' | 'member') || 'member',
+            created_at: groupData.created_at as string,
+            updated_at: groupData.updated_at as string,
+            user: {
+              id: user.id as string,
+              name: user.name as string,
+              avatar_url: user.avatar_url as string | null,
+              email: null
+            }
+          };
+        });
+        
+        console.log('الأعضاء مع الأدوار:', membersWithRoles);
+        
+        // تحديث حالة المجموعة مع الأعضاء
+        const group: Group = {
+          id: groupData.id as string,
+          name: groupData.name as string,
+          created_by: groupData.created_by as string,
+          created_at: groupData.created_at as string,
+          updated_at: groupData.updated_at as string,
+          members: membersWithRoles
+        };
+        
+        setGroupDetails(group);
+      } catch (error) {
+        console.error('خطأ غير متوقع في جلب بيانات المجموعة:', error);
+      }
+    };
+    
+    fetchGroupDetails();
+  }, [groupId, supabase]);
+
+  // Fetch messages
+  useEffect(() => {
+    const fetchMessages = async () => {
+      try {
+        setError(null);
+        setLoading(true);
+
+        if (!groupId) {
+          console.log('No group ID provided');
+          setMessages([]);
+          setLoading(false);
+          return;
+        }
+
+        let query = supabase
+          .from('messages')
+          .select(`
+            *,
+            user:user_id (
+              id,
+              name,
+              avatar_url
+            )
+          `)
+          .order('timestamp', { ascending: true });
+          
+        // إذا تم تحديد مجموعة، قم بتصفية الرسائل حسب معرف المجموعة
+        if (groupId) {
+          query = query.eq('group_id', groupId);
+        }
+        
+        const { data, error: messagesError } = await query;
+
+        if (messagesError) {
+          console.error('Detailed error fetching messages:', JSON.stringify(messagesError, null, 2));
+          setError(`فشل في جلب الرسائل: ${messagesError.message}`);
+          throw messagesError;
+        }
+        
+        if (data) {
+          const formattedMessages = data.map(message => ({
+            ...message,
+            user: message.user as unknown as User
+          })) as (Message & { user?: User })[];
+          
+          setMessages(formattedMessages);
+          
+          // تحديث حالة الرسائل لتصبح مقروءة عند المستخدم الحالي
+          if (currentUser) {
+            try {
+              // معالجة كل رسالة غير مقروءة
+              const unreadMessages = data.filter(msg => 
+                msg.user_id !== currentUser.id && // ليست رسائل المستخدم نفسه
+                (!msg.read_by || !(msg.read_by as string[])?.includes(currentUser.id)) // لم يقرأها بعد
+              );
+              
+              if (unreadMessages.length > 0) {
+                console.log(`تحديث ${unreadMessages.length} رسائل كمقروءة`);
+                
+                // معالجة كل رسالة على حدة
+                for (const msg of unreadMessages) {
+                  // تحضير مصفوفة read_by المحدثة
+                  let updatedReadBy: string[] = [];
+                  
+                  if (msg.read_by && Array.isArray(msg.read_by)) {
+                    updatedReadBy = [...(msg.read_by as string[])];
+                    if (!updatedReadBy.includes(currentUser.id)) {
+                      updatedReadBy.push(currentUser.id);
+                    }
+                  } else {
+                    updatedReadBy = [currentUser.id];
+                  }
+                  
+                  // تحديث الرسالة
+                  const { error: updateError } = await supabase
+                    .from('messages')
+                    .update({
+                      read_by: updatedReadBy,
+                      is_read: true
+                    })
+                    .match({ id: msg.id });
+                    
+                  if (updateError) {
+                    console.error(`خطأ في تحديث حالة قراءة الرسالة ${msg.id}:`, updateError);
+                  }
+                }
+                
+                console.log(`تم تحديث ${unreadMessages.length} رسائل كمقروءة`);
+              }
+            } catch (markError) {
+              console.error('خطأ في تحديث حالة قراءة الرسائل:', markError);
+              // استمر بدون توقف حتى لو فشلت عملية تحديث حالة القراءة
+            }
+          }
+        } else {
+          setMessages([]);
+        }
+      } catch (err) {
+        console.error('Error fetching messages:', err);
+        setError('فشل في جلب الرسائل. يرجى التحقق من اتصالك بالإنترنت والمحاولة مرة أخرى.');
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchMessages();
+  }, [groupId, currentUser]);
+
+  // Set up realtime subscription
+  useEffect(() => {
+    if (!groupId) return;
+
+    console.log(`Setting up realtime subscription for group ${groupId}`);
+
+    const channelName = `group-${groupId}-messages`;
+    console.log(`Creating new channel: ${channelName}`);
+
+    const channel = supabase.channel(channelName);
+    
+    // @ts-ignore - لتجاوز مشكلة أنواع البيانات في Supabase Realtime
+    const realtimeChannel = channel.on('postgres_changes', {
+        event: '*', // استماع لجميع الأحداث (INSERT, UPDATE, DELETE)
+        schema: 'public',
+        table: 'messages',
+        filter: `group_id=eq.${groupId}`,
+      }, async (payload) => {
+        console.log('REALTIME: Received message event:', payload);
+        
+        // @ts-ignore - الوصول إلى eventType الموجود في كائن Payload
+        const eventType = payload.eventType;
+        
+        // معالجة مختلف أنواع الأحداث
+        switch (eventType) {
+          case 'INSERT':
+            try {
+              // جلب بيانات المستخدم للرسالة الجديدة
+              const { data: userData, error: userError } = await supabase
+                .from('users')
+                .select('*')
+                // @ts-ignore - الوصول إلى payload.new.user_id
+                .eq('id', payload.new.user_id)
+                .single();
+
+              // @ts-ignore - الوصول إلى payload.new
+              const newMessage = {
+                ...payload.new,
+                user: userError ? null : userData,
+              } as unknown as Message & { user?: User };
+
+              // إذا كانت الرسالة من المستخدم الحالي، نتحقق من وجود رسالة مؤقتة
+              // @ts-ignore - الوصول إلى payload.new.user_id
+              if (currentUser && payload.new.user_id === currentUser.id) {
+                setMessages(prev => {
+                  // تحقق من وجود رسالة مؤقتة بنفس المحتوى
+                  // @ts-ignore - الوصول إلى payload.new.message
+                  const hasTemp = prev.some(msg => 
+                    msg.id === -1 && msg.message === payload.new.message
+                  );
+
+                  if (hasTemp) {
+                    // استبدال الرسالة المؤقتة بالرسالة الحقيقية
+                    return prev.map(msg => 
+                      // @ts-ignore - الوصول إلى payload.new.message
+                      (msg.id === -1 && msg.message === payload.new.message)
+                        ? newMessage
+                        : msg
+                    );
+                  } else {
+                    // إضافة الرسالة الجديدة (غير المكررة)
+                    // تحقق من عدم وجود الرسالة بنفس المعرف
+                    // @ts-ignore - الوصول إلى payload.new.id
+                    const exists = prev.some(msg => msg.id === payload.new.id);
+                    return exists ? prev : [...prev, newMessage];
+                  }
+                });
+              } else {
+                // رسائل المستخدمين الآخرين - إضافة مباشرة مع التحقق من التكرار
+                setMessages(prev => {
+                  // تحقق من عدم وجود الرسالة بنفس المعرف
+                  // @ts-ignore - الوصول إلى payload.new.id
+                  const exists = prev.some(msg => msg.id === payload.new.id);
+                  return exists ? prev : [...prev, newMessage];
+                });
+              }
+            } catch (err) {
+              console.error('Error processing realtime INSERT message:', err);
+            }
+            break;
+            
+          case 'UPDATE':
+            try {
+              // تحديث الرسالة الموجودة
+              const { data: userData, error: userError } = await supabase
+                .from('users')
+                .select('*')
+                // @ts-ignore - الوصول إلى payload.new.user_id
+                .eq('id', payload.new.user_id)
+                .single();
+                
+              // @ts-ignore - الوصول إلى payload.new
+              const updatedMessage = {
+                ...payload.new,
+                user: userError ? null : userData,
+              } as unknown as Message & { user?: User };
+              
+              setMessages(prev => 
+                // @ts-ignore - الوصول إلى payload.new.id
+                prev.map(msg => msg.id === payload.new.id ? updatedMessage : msg)
+              );
+            } catch (err) {
+              console.error('Error processing realtime UPDATE message:', err);
+            }
+            break;
+            
+          case 'DELETE':
+            // حذف الرسالة من الواجهة
+            setMessages(prev => 
+              // @ts-ignore - الوصول إلى payload.old.id
+              prev.filter(msg => msg.id !== payload.old.id)
+            );
+            break;
+            
+          default:
+            console.log('Unhandled event type:', eventType);
+        }
+      })
+      .subscribe(status => {
+        console.log(`REALTIME: Subscription status for ${channelName}:`, status);
+      });
+
+    // تنظيف الاشتراك عند تفكيك المكون
+    return () => {
+      console.log(`Cleaning up realtime subscription for ${channelName}`);
+      supabase.removeChannel(realtimeChannel);
+    };
+  }, [groupId, currentUser]);
+
+  // إرسال رسالة جديدة
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    if (!newMessage.trim() || !currentUser || !groupId) return;
+    
+    console.log('Attempting to send message:', { message: newMessage, userId: currentUser.id, groupId });
+    
+    // حفظ قيمة الرسالة قبل مسحها من حقل الإدخال
+    const messageText = newMessage;
+    
+    // مسح حقل الإدخال فورًا لتحسين تجربة المستخدم
+    setNewMessage('');
+    
+    // إضافة رسالة مؤقتة للعرض المباشر
+    const optimisticMessage: Message & { user?: User } = {
+      id: -1, // معرف سالب مؤقت لن يتعارض مع قاعدة البيانات
+      user_id: currentUser.id,
+      message: messageText,
+      group_id: groupId,
+      timestamp: new Date().toISOString(),
+      message_type: 'text',
+      user: currentUser
+    };
+    
+    // إضافة الرسالة المؤقتة إلى واجهة المستخدم
+    setMessages(prev => [...prev, optimisticMessage]);
+    
+    try {
+      // إرسال الرسالة إلى قاعدة البيانات
+      const { data, error: sendError } = await supabase
+        .from('messages')
+        .insert([{ 
+          user_id: currentUser.id, 
+          message: messageText,
+          group_id: groupId,
+          message_type: 'text',
+          timestamp: new Date().toISOString()
+        }])
+        .select();
+      
+      if (sendError) {
+        console.error('Detailed error sending message:', JSON.stringify(sendError, null, 2));
+        setError(`فشل في إرسال الرسالة: ${sendError.message}`);
+        
+        // إزالة الرسالة المؤقتة في حالة الفشل
+        setMessages(prev => prev.filter(msg => msg.id !== -1));
+        throw sendError;
+      }
+      
+      // في حال النجاح، نتجاهل التحديث لأن مكون الاشتراك سيستقبلها تلقائيًا
+      // وهذا يمنع التكرار المحتمل للرسائل
+    } catch (err) {
+      console.error('Error sending message:', err);
+      setError('فشل في إرسال الرسالة. يرجى المحاولة مرة أخرى.');
+    }
+  };
+
+  // إرسال قائمة منتجات
+  const handleSendProductList = async (productList: ProductListMessage) => {
+    if (!currentUser || !groupId) {
+      setError('يجب تسجيل الدخول لإرسال قائمة منتجات');
+      return;
+    }
+    
+    try {
+      // تحويل قائمة المنتجات إلى نص JSON
+      const productListJson = JSON.stringify(productList);
+      
+      // إرسال الرسالة مع نوع "product_list"
+      const { data, error: sendError } = await supabase
+        .from('messages')
+        .insert([{ 
+          user_id: currentUser.id, 
+          message: productList.title || 'قائمة منتجات',
+          group_id: groupId,
+          message_type: 'product_list',
+          product_list: productList,
+          timestamp: new Date().toISOString()
+        }])
+        .select();
+      
+      if (sendError) {
+        console.error('Detailed error sending product list:', JSON.stringify(sendError, null, 2));
+        setError(`فشل في إرسال قائمة المنتجات: ${sendError.message}`);
+        throw sendError;
+      }
+      
+      // في حال النجاح، نتجاهل التحديث لأن مكون الاشتراك سيستقبلها تلقائيًا
+    } catch (err) {
+      console.error('Error sending product list:', err);
+      setError('فشل في إرسال قائمة المنتجات. يرجى المحاولة مرة أخرى.');
+      throw err;
+    }
+  };
+
+  // تعريف وظيفة مساعدة للتصحيح وإظهار المعلومات
+  const logDebugInfo = () => {
+    if (groupDetails?.members) {
+      console.log('Debug - Sheet Open Status:', sheetOpen);
+      console.log('Debug - Group Details:', groupDetails);
+      console.log('Debug - Group Members Count:', groupDetails.members.length);
+    }
+  };
+  
+  // دالة لتبديل حالة الشيت
+  const toggleSheet = () => {
+    console.log('Toggling sheet from', sheetOpen, 'to', !sheetOpen);
+    setSheetOpen(!sheetOpen);
+    logDebugInfo();
+  };
+
+  if (loading) {
+    return (
+      <div className="flex justify-center items-center h-[600px] w-full">
+        <div className="flex flex-col items-center gap-2">
+          <div className="h-8 w-8 animate-spin rounded-full border-4 border-t-blue-500 border-r-transparent border-b-blue-500 border-l-transparent"></div>
+          <p className="text-muted-foreground">جاري تحميل المحادثة...</p>
+        </div>
+      </div>
+    );
+  }
+  
+  if (!groupId) {
+    return (
+      <div className="flex flex-col items-center justify-center h-[600px] w-full text-center p-4">
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 text-gray-400 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+        </svg>
+        <p className="text-lg font-medium">الرجاء اختيار مجموعة للمحادثة</p>
+        <p className="text-muted-foreground mt-2">قم باختيار مجموعة من القائمة للبدء في المحادثة</p>
+      </div>
+    );
+  }
+
+  // عنصر واجهة الدردشة
+  return (
+    <div className="flex flex-col h-[600px] max-h-[600px] w-full border rounded-lg shadow-sm bg-white">
+      {/* رأس المحادثة */}
+      <div className="flex items-center justify-between border-b p-4">
+        <div className="flex items-center gap-3">
+          <Avatar className="h-9 w-9">
+            <AvatarImage src="" />
+            <AvatarFallback className="bg-primary/10 text-primary">
+              {groupDetails?.name?.charAt(0) || "G"}
+            </AvatarFallback>
+          </Avatar>
+          <div>
+            <h3 className="font-medium">{groupDetails?.name || "المجموعة"}</h3>
+            <p className="text-xs text-muted-foreground">
+              {groupDetails?.members?.length || 0} {groupDetails?.members?.length === 1 ? 'عضو' : 'أعضاء'}
+            </p>
+          </div>
+        </div>
+        
+        <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
+          <SheetTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="rounded-full"
+              onClick={() => {
+                console.log("فتح قائمة أعضاء المجموعة");
+                setSheetOpen(true);
+              }}
+            >
+              <Users className="h-5 w-5" />
+              <span className="sr-only">أعضاء المجموعة</span>
+            </Button>
+          </SheetTrigger>
+          <SheetContent side="right" className="max-w-sm rtl:pr-8 ltr:pl-8">
+            <SheetHeader className="mb-4">
+              <SheetTitle>{groupDetails?.name || "المجموعة"} - الأعضاء</SheetTitle>
+            </SheetHeader>
+            <div className="py-4">
+              {/* محتوى الأعضاء */}
+              {groupDetails?.members && groupDetails.members.length > 0 ? (
+                <div className="space-y-4">
+                  {/* عرض الأعضاء */}
+                  {groupDetails.members.map((member) => (
+                    <div key={member.id} className="flex items-center gap-3 p-2 rounded-md hover:bg-gray-100">
+                      <Avatar className="h-12 w-12">
+                        <AvatarImage src={member.avatar_url || ""} />
+                        <AvatarFallback className="bg-primary/10 text-primary">
+                          {member.name?.charAt(0) || "U"}
+                        </AvatarFallback>
+                      </Avatar>
+                      <div>
+                        <p className="font-medium">{member.name}</p>
+                        <p className="text-xs text-muted-foreground">
+                          {member.id === currentUser?.id ? 'أنت' : 'عضو'}
+                        </p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center h-40 text-center">
+                  <p className="text-muted-foreground mb-4">لا يوجد أعضاء في هذه المجموعة</p>
+                  <Button 
+                    variant="outline" 
+                    className="mt-2"
+                    onClick={() => {
+                      // إعادة تحديث البيانات
+                      const fetchGroupDetails = async () => {
+                        if (!groupId) return;
+                        
+                        try {
+                          console.log('إعادة تحميل بيانات المجموعة:', groupId);
+                          
+                          // جلب تفاصيل المجموعة
+                          const { data: groupData, error: groupError } = await supabase
+                            .from('groups')
+                            .select('*')
+                            .eq('id', groupId)
+                            .single();
+                            
+                          if (groupError) {
+                            console.error('خطأ في جلب بيانات المجموعة:', groupError);
+                            return;
+                          }
+                          
+                          // جلب أعضاء المجموعة
+                          const { data: groupMembers, error: membersError } = await supabase
+                            .from('group_members')
+                            .select('user_id, role')
+                            .eq('group_id', groupId);
+                            
+                          if (membersError) {
+                            console.error('خطأ في جلب أعضاء المجموعة:', membersError);
+                            return;
+                          }
+
+                          console.log('تم جلب أعضاء المجموعة:', groupMembers.length, groupMembers);
+                          
+                          if (groupMembers.length === 0) {
+                            console.log('لا يوجد أعضاء في المجموعة');
+                            // إنشاء كائن المجموعة بدون أعضاء
+                            const group: Group = {
+                              id: groupData.id as string,
+                              name: groupData.name as string,
+                              created_by: groupData.created_by as string,
+                              created_at: groupData.created_at as string,
+                              updated_at: groupData.updated_at as string,
+                              members: []
+                            };
+                            setGroupDetails(group);
+                            return;
+                          }
+                          
+                          // جلب تفاصيل المستخدمين
+                          const userIds = groupMembers.map(member => member.user_id);
+                          const { data: usersData, error: usersError } = await supabase
+                            .from('users')
+                            .select('*')
+                            .in('id', userIds);
+                            
+                          if (usersError) {
+                            console.error('خطأ في جلب بيانات المستخدمين:', usersError);
+                            return;
+                          }
+
+                          console.log('تم جلب بيانات المستخدمين:', usersData.length, usersData);
+                          
+                          // ربط بيانات المستخدمين بأدوارهم في المجموعة
+                          const membersWithRoles: GroupMember[] = usersData.map(user => {
+                            const memberInfo = groupMembers.find(member => member.user_id === user.id);
+                            // إنشاء كائن عضو المجموعة
+                            return {
+                              id: user.id as string, // نستخدم معرف المستخدم كمعرف للعضو للتبسيط
+                              group_id: groupId,
+                              user_id: user.id as string,
+                              role: (memberInfo?.role as 'admin' | 'member') || 'member',
+                              created_at: groupData.created_at as string,
+                              updated_at: groupData.updated_at as string,
+                              user: {
+                                id: user.id as string,
+                                name: user.name as string,
+                                avatar_url: user.avatar_url as string | null,
+                                email: null
+                              }
+                            };
+                          });
+                          
+                          console.log('الأعضاء مع الأدوار:', membersWithRoles);
+                          
+                          // تحديث حالة المجموعة مع الأعضاء
+                          const group: Group = {
+                            id: groupData.id as string,
+                            name: groupData.name as string,
+                            created_by: groupData.created_by as string,
+                            created_at: groupData.created_at as string,
+                            updated_at: groupData.updated_at as string,
+                            members: membersWithRoles
+                          };
+                          
+                          setGroupDetails(group);
+                        } catch (error) {
+                          console.error('خطأ غير متوقع في جلب بيانات المجموعة:', error);
+                        }
+                      };
+                      
+                      fetchGroupDetails();
+                    }}
+                  >
+                    تحديث القائمة
+                  </Button>
+                </div>
+              )}
+              <div className="mt-6 pt-4 border-t">
+                <p className="text-sm text-muted-foreground">إجمالي الأعضاء: {groupDetails?.members?.length || 0}</p>
+                <Button 
+                  className="w-full mt-4" 
+                  variant="outline"
+                  onClick={() => setSheetOpen(false)}
+                >
+                  إغلاق
+                </Button>
+              </div>
+            </div>
+          </SheetContent>
+        </Sheet>
+      </div>
+      
+      {error && (
+        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded-md m-4" role="alert">
+          <div className="flex items-center">
+            <svg 
+              className="h-5 w-5 text-red-500 mr-2" 
+              viewBox="0 0 20 20" 
+              fill="currentColor"
+            >
+              <path 
+                fillRule="evenodd" 
+                d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" 
+                clipRule="evenodd" 
+              />
+            </svg>
+            <span>{error}</span>
+          </div>
+          <button
+            className="absolute right-4 top-4"
+            onClick={() => setError(null)}
+            aria-label="إغلاق"
+          >
+            <span className="sr-only">إغلاق</span>
+            <svg
+              className="h-4 w-4 text-red-500"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      )}
+      
+      {/* حاوية الرسائل */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50 dark:bg-gray-900">
+        {messages.length > 0 ? (
+          <div className="space-y-4">
+            {messages.map((message) => (
+              <div 
+                key={message.id} 
+                className={`flex ${message.user_id === currentUser?.id ? 'justify-end' : 'justify-start'}`}
+              >
+                {message.user_id !== currentUser?.id && (
+                  <Avatar className="h-8 w-8 mr-2 mt-1 flex-shrink-0">
+                    <AvatarImage src={message.user?.avatar_url || ""} />
+                    <AvatarFallback className="bg-primary/10 text-primary text-xs">
+                      {message.user?.name?.charAt(0) || "U"}
+                    </AvatarFallback>
+                  </Avatar>
+                )}
+                
+                <div 
+                  className={`max-w-[70%] rounded-lg p-3 ${
+                    message.user_id === currentUser?.id 
+                      ? 'bg-primary text-primary-foreground rounded-br-none' 
+                      : 'bg-muted rounded-bl-none'
+                  }`}
+                >
+                  <div className="font-medium text-xs mb-1">
+                    {message.user_id === currentUser?.id ? 'أنت' : message.user?.name || 'مستخدم'}
+                  </div>
+                  {message.message_type === 'product_list' && message.product_list ? (
+                    <div className="text-black">
+                      <ProductListView 
+                        productList={message.product_list} 
+                        editable={message.user_id === currentUser?.id}
+                        messageId={message.id}
+                        onUpdate={async (updatedProductList) => {
+                          try {
+                            // تحديث الرسالة في قاعدة البيانات
+                            const { error: updateError } = await supabase
+                              .from('messages')
+                              .update({ 
+                                message: updatedProductList.title || 'قائمة منتجات',
+                                product_list: updatedProductList
+                              })
+                              .eq('id', message.id);
+                              
+                            if (updateError) {
+                              console.error('فشل تحديث قائمة المنتجات:', updateError);
+                            }
+                          } catch (err) {
+                            console.error('خطأ أثناء تحديث قائمة المنتجات:', err);
+                          }
+                        }}
+                      />
+                    </div>
+                  ) : (
+                    <p className="break-words">{message.message}</p>
+                  )}
+                  <div className="text-xs mt-1 opacity-70 text-right flex justify-end items-center gap-2">
+                    {message.timestamp ? formatDate(message.timestamp) : ''}
+                    {message.message_type === 'product_list' && message.product_list && message.user_id === currentUser?.id && (
+                      <Button 
+                        onClick={() => {
+                          // العثور على عنصر ProductListView وتشغيل وظيفة التعديل الخاصة به
+                          const productListElem = document.getElementById(`product-list-${message.id}`);
+                          if (productListElem) {
+                            const editButton = productListElem.querySelector('button[data-action="edit"]');
+                            if (editButton) {
+                              (editButton as HTMLButtonElement).click();
+                            }
+                          }
+                        }} 
+                        variant="ghost" 
+                        size="sm" 
+                        className="p-0 h-5 text-xs hover:bg-transparent"
+                      >
+                        <PenLine className="h-3 w-3 mr-1" />
+                        <span>تعديل</span>
+                      </Button>
+                    )}
+                  </div>
+                </div>
+                
+                {message.user_id === currentUser?.id && (
+                  <Avatar className="h-8 w-8 ml-2 mt-1 flex-shrink-0">
+                    <AvatarImage src={currentUser?.avatar_url || ""} />
+                    <AvatarFallback className="bg-primary text-primary-foreground text-xs">
+                      {currentUser?.name?.charAt(0) || "أ"}
+                    </AvatarFallback>
+                  </Avatar>
+                )}
+              </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </div>
+        ) : (
+          <div className="h-full flex flex-col items-center justify-center">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 text-gray-400 mb-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+            </svg>
+            <p className="text-gray-500 text-center">لا توجد رسائل بعد. كن أول من يبدأ المحادثة!</p>
+          </div>
+        )}
+      </div>
+      
+      {/* نموذج إرسال الرسائل */}
+      <div className="border-t p-4">
+        <form onSubmit={handleSendMessage} className="flex gap-2">
+          <div className="flex items-center gap-2">
+            <ProductMessage 
+              currentUser={currentUser} 
+              groupId={groupId || ''} 
+              onSendProductList={handleSendProductList} 
+            />
+          </div>
+          <input
+            type="text"
+            value={newMessage}
+            onChange={(e) => setNewMessage(e.target.value)}
+            className="flex-1 px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent"
+            placeholder="اكتب رسالتك هنا..."
+          />
+          <Button 
+            type="submit" 
+            disabled={!newMessage.trim()}
+            className="shrink-0"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 rotate-180" viewBox="0 0 20 20" fill="currentColor">
+              <path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z" />
+            </svg>
+            <span className="ml-2 sr-only md:not-sr-only">إرسال</span>
+          </Button>
+        </form>
+      </div>
+    </div>
+  );
+}
